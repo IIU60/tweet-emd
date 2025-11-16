@@ -1,82 +1,175 @@
-"""Compute semantic distances between Twitter accounts using Earth Mover's Distance.
+"""
+Compute semantic distances between Twitter accounts using Earth Mover's Distance (EMD).
 
-This script loads a dataset of tweets, embeds each tweet using a TF-IDF model
-with latent semantic analysis, and measures the Earth Mover's Distance (EMD)
-between the resulting embedding distributions of two accounts. The EMD is
-obtained by solving a minimum-cost flow problem with NetworkX.
+Changes vs the older version:
+- Sentence-level embeddings (all-MiniLM-L6-v2) instead of TF-IDF.
+- L2-normalization of every tweet vector.
+- Cosine distance as ground cost: C_ij = 1 - x_i · y_j, with x,y unit vectors.
+- Gentle tweet preprocessing: URL domains, split hashtags, mentions->@user, emojis->emoji_token.
+- Exact EMD via NetworkX min_cost_flow with integer cost scaling.
+- Utility to return top-5 most similar accounts.
+
+The goal is to keep this file highly readable for beginners, with many comments
+that explain *why* each step exists.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from math import gcd
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 import networkx as nx
 import numpy as np
 import pandas as pd
-from sklearn.decomposition import TruncatedSVD
-from sklearn.feature_extraction.text import TfidfVectorizer
+from sentence_transformers import SentenceTransformer
+from sklearn.preprocessing import normalize
+
+# ---------------------------------------------------------------------------
+# Tokenization helpers
+# ---------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
+def _split_hashtag(token: str) -> List[str]:
+    """Split a hashtag token into smaller parts.
+
+    The goal is not perfect linguistics—just a lightweight heuristic so
+    ``#BestDayEver2024`` becomes ``["best", "day", "ever", "2024"]``. We look
+    for transitions between lowercase/uppercase/number boundaries.
+    """
+
+    # Remove the leading '#', then split on transitions from lower->upper or
+    # letter->digit. The regex keeps boundaries by inserting spaces we can split on.
+    cleaned = token.lstrip("#")
+    if not cleaned:
+        return []
+
+    parts = re.sub(r"(?<=[a-z])(?=[A-Z])|(?<=[A-Za-z])(?=[0-9])", " ", cleaned)
+    return [p.lower() for p in parts.split() if p]
+
+
+# Simple emoji pattern: matches surrogate pair ranges and common emoji blocks.
+_EMOJI_RE = re.compile(
+    r"[\U0001F600-\U0001F64F]|"  # emoticons
+    r"[\U0001F300-\U0001F5FF]|"  # symbols & pictographs
+    r"[\U0001F680-\U0001F6FF]|"  # transport & map symbols
+    r"[\U0001F700-\U0001F77F]|"  # alchemical symbols
+    r"[\U0001F780-\U0001F7FF]|"  # geometric shapes extended
+    r"[\U0001F800-\U0001F8FF]|"  # supplemental arrows-c
+    r"[\U0001F900-\U0001F9FF]|"  # supplemental symbols & pictographs
+    r"[\U0001FA00-\U0001FA6F]|"  # chess symbols, etc.
+    r"[\u2600-\u26FF]|"           # miscellaneous symbols
+    r"[\u2700-\u27BF]"            # dingbats
+)
+
+
+def preprocess_tweet(text: str) -> str:
+    """Gently normalize a tweet while keeping most of its information.
+
+    Steps (kept intentionally simple so the logic is easy to follow):
+    - Lowercase everything so comparisons are case-insensitive.
+    - Replace URLs with their domain (``url_domain_example.com``) so links still
+      contribute semantic signal without huge unique tokens.
+    - Replace mentions with a generic ``@user`` token to avoid overfitting on
+      specific handles.
+    - Expand hashtags: keep the raw hashtag token (``hashtag_bestday``) and also
+      split camelCase/number boundaries to surface individual words.
+    - Replace emojis with ``emoji_token`` to preserve their presence.
+    - Collapse extra whitespace.
+    """
+
+    text = (text or "").strip().lower()
+
+    # Replace URLs with their domain to keep some semantic cue.
+    def _replace_url(match: re.Match[str]) -> str:
+        url = match.group(0)
+        # Extract the domain by stripping the protocol and path.
+        domain_match = re.search(r"https?://([^/\s]+)", url)
+        domain = domain_match.group(1) if domain_match else "link"
+        # Remove a trailing slash if present.
+        domain = domain.rstrip('/')
+        return f"url_domain_{domain}"
+
+    text = re.sub(r"https?://[^\s]+", _replace_url, text)
+
+    # Replace mentions with a friendly placeholder.
+    text = re.sub(r"@[A-Za-z0-9_]+", "@user", text)
+
+    tokens: List[str] = []
+    for raw_token in text.split():
+        # Identify and replace emojis with a generic token. We keep only the
+        # generic marker instead of removing them altogether.
+        if _EMOJI_RE.search(raw_token):
+            raw_token = _EMOJI_RE.sub(" emoji_token ", raw_token)
+
+        # Handle hashtags: keep both the raw form and the split pieces.
+        if raw_token.startswith("#"):
+            tokens.append(f"hashtag_{raw_token.lstrip('#')}")
+            tokens.extend(_split_hashtag(raw_token))
+            continue
+
+        tokens.append(raw_token)
+
+    # Collapse repeated whitespace that may have appeared during replacements.
+    cleaned = " ".join(token for token in tokens if token)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+# ---------------------------------------------------------------------------
+# Embedding utilities
+# ---------------------------------------------------------------------------
+
+
+@dataclass
 class AccountEmbeddings:
-    """Container for the embeddings associated with a single account."""
+    """Container holding an account name and its tweet embeddings."""
 
     account: str
     vectors: np.ndarray
 
     def __post_init__(self) -> None:
         if self.vectors.ndim != 2:
-            raise ValueError("Embeddings must be provided as a 2D array.")
+            raise ValueError("Embeddings must be a 2D array of shape (n_tweets, dim).")
 
-    def __len__(self) -> int:  # pragma: no cover - trivial
+    def __len__(self) -> int:  # pragma: no cover - trivial helper
         return self.vectors.shape[0]
 
 
-def load_account_embeddings(
-    dataset_path: Path | str,
-    max_features: int = 5000,
-    n_components: int = 256,
-) -> Dict[str, AccountEmbeddings]:
-    """Load tweets and compute embeddings grouped by account.
+
+def load_account_embeddings(dataset_path: Path | str) -> Dict[str, AccountEmbeddings]:
+    """Load tweets from CSV, preprocess, embed, and group by account.
 
     Parameters
     ----------
     dataset_path:
-        Path to the CSV file containing the tweet dataset.
-    max_features:
-        Maximum number of TF-IDF features to keep.
-    n_components:
-        Number of latent semantic components to retain with Truncated SVD.
+        Path to a CSV file with ``author`` and ``content`` columns.
 
     Returns
     -------
     Dict[str, AccountEmbeddings]
-        Mapping from account name to its corresponding embeddings.
+        Mapping from account handle to its L2-normalized tweet embeddings.
     """
 
     df = pd.read_csv(dataset_path)
     if "content" not in df or "author" not in df:
-        raise ValueError("Dataset must contain 'content' and 'author' columns.")
+        raise ValueError("Dataset must contain 'author' and 'content' columns.")
 
-    contents = df["content"].fillna("").tolist()
-    tfidf = TfidfVectorizer(
-        max_features=max_features,
-        ngram_range=(1, 2),
-        min_df=2,
-    ).fit_transform(contents)
+    # Apply lightweight normalization so the model sees consistent tokens.
+    preprocessed = [preprocess_tweet(text) for text in df["content"].fillna("")]
 
-    if n_components is not None and n_components < tfidf.shape[1]:
-        projector = TruncatedSVD(n_components=n_components, random_state=0)
-        embedded = projector.fit_transform(tfidf)
-    else:
-        embedded = tfidf.toarray()
+    # Sentence-transformer handles sentence-level semantics far better than
+    # bag-of-words TF-IDF, while remaining lightweight.
+    model = SentenceTransformer("all-MiniLM-L6-v2")
+    embeddings = model.encode(preprocessed, convert_to_numpy=True, show_progress_bar=False)
 
-    embeddings = embedded.astype(np.float32)
+    # Ensure each tweet vector has L2 norm = 1 so cosine distance is simply
+    # ``1 - dot_product``.
+    embeddings = normalize(embeddings, norm="l2")
 
     df = df.copy()
-    df["embedding"] = list(embeddings)
+    df["embedding"] = list(embeddings.astype(np.float32))
 
     grouped: Dict[str, AccountEmbeddings] = {}
     for account, rows in df.groupby("author", sort=False):
@@ -86,8 +179,13 @@ def load_account_embeddings(
     return grouped
 
 
+# ---------------------------------------------------------------------------
+# Earth Mover's Distance via min-cost flow
+# ---------------------------------------------------------------------------
+
+
 def _lcm(a: int, b: int) -> int:
-    """Least common multiple of two integers."""
+    """Least common multiple used to balance tweet masses."""
 
     if a == 0 or b == 0:
         raise ValueError("Cannot compute LCM with zero.")
@@ -98,19 +196,13 @@ def earth_movers_distance(
     left: AccountEmbeddings | np.ndarray,
     right: AccountEmbeddings | np.ndarray,
 ) -> float:
-    """Compute the Earth Mover's Distance between two embedding sets.
+    """Compute EMD between two sets of tweet embeddings using cosine cost.
 
-    Parameters
-    ----------
-    left, right:
-        Either ``AccountEmbeddings`` objects or numpy arrays of shape (n, d)
-        and (m, d). The function supports distributions with different numbers
-        of samples by evenly distributing the unit mass across tweets.
-
-    Returns
-    -------
-    float
-        The EMD between the two distributions.
+    The cost between individual tweets is ``1 - x·y`` where both vectors are
+    already L2-normalized. NetworkX expects *integer* costs, so we scale by
+    ``cost_scale`` before solving, then divide to recover the floating value.
+    Supplies/demands are balanced using the least common multiple so both sides
+    carry equal total mass regardless of tweet counts.
     """
 
     left_vectors = left.vectors if isinstance(left, AccountEmbeddings) else np.asarray(left)
@@ -123,81 +215,109 @@ def earth_movers_distance(
     if n_left == 0 or n_right == 0:
         raise ValueError("Cannot compute EMD with empty embeddings.")
 
-    graph = nx.DiGraph()
+    # Compute cosine-based costs. Because vectors are normalized, dot products
+    # live in [-1, 1], so ``1 - dot`` lives in [0, 2].
+    cost_matrix = 1.0 - np.clip(left_vectors @ right_vectors.T, -1.0, 1.0)
+
+    # NetworkX requires integer weights. Scaling by 10_000 preserves four
+    # decimal places while keeping numbers small enough for exact solvers.
+    cost_scale = 10_000
+    scaled_costs = np.round(cost_matrix * cost_scale).astype(int)
+
     total_mass = _lcm(n_left, n_right)
     left_mass = total_mass // n_left
     right_mass = total_mass // n_right
 
-    # Add supply nodes for the left distribution.
+    graph = nx.DiGraph()
+
+    # Supply nodes (left tweets) provide mass.
     for idx in range(n_left):
-        node = f"L{idx}"
-        graph.add_node(node, demand=-left_mass)
+        graph.add_node(f"L{idx}", demand=-left_mass)
 
-    # Add demand nodes for the right distribution.
+    # Demand nodes (right tweets) consume mass.
     for idx in range(n_right):
-        node = f"R{idx}"
-        graph.add_node(node, demand=right_mass)
+        graph.add_node(f"R{idx}", demand=right_mass)
 
-    # Use an integer scaling factor so that min_cost_flow accepts the costs.
-    cost_scale = 1000
-
+    # Each left tweet can send its full mass to any right tweet.
     for i in range(n_left):
         for j in range(n_right):
-            cost = float(np.linalg.norm(left_vectors[i] - right_vectors[j]))
             graph.add_edge(
                 f"L{i}",
                 f"R{j}",
-                weight=int(round(cost * cost_scale)),
+                weight=int(scaled_costs[i, j]),
                 capacity=left_mass,
             )
 
-    flow_dict = nx.min_cost_flow(graph)
+    flow = nx.min_cost_flow(graph)
 
     total_cost = 0
     for i in range(n_left):
         for j in range(n_right):
-            amount = flow_dict[f"L{i}"].get(f"R{j}", 0)
-            if amount:
-                total_cost += amount * graph[f"L{i}"][f"R{j}"]["weight"]
+            shipped = flow[f"L{i}"].get(f"R{j}", 0)
+            if shipped:
+                total_cost += shipped * graph[f"L{i}"][f"R{j}"]["weight"]
 
+    # Rescale to the original floating-space EMD.
     emd_value = total_cost / (cost_scale * total_mass)
     return emd_value
 
 
-def closest_account(
-    target_account: str,
+# ---------------------------------------------------------------------------
+# Top-k neighbors and CLI
+# ---------------------------------------------------------------------------
+
+
+def top_k_similar_accounts(
+    target: str,
     embeddings: Dict[str, AccountEmbeddings],
-) -> Tuple[str, float]:
-    """Identify the account closest to ``target_account`` using EMD."""
+    k: int = 5,
+) -> List[Tuple[str, float]]:
+    """Return the top-k accounts closest to ``target`` by EMD.
 
-    if target_account not in embeddings:
-        raise KeyError(f"Unknown account: {target_account}")
+    The target account is excluded from the results. Distances are sorted
+    ascending (smaller EMD means more similar semantics).
+    """
 
-    target_embeddings = embeddings[target_account]
-    best_account: str | None = None
-    best_distance: float | None = None
+    if target not in embeddings:
+        raise KeyError(f"Unknown target account: {target}")
 
+    target_embeddings = embeddings[target]
+    distances: List[Tuple[str, float]] = []
     for account, account_embeddings in embeddings.items():
-        if account == target_account:
+        if account == target:
             continue
-
         distance = earth_movers_distance(target_embeddings, account_embeddings)
-        if best_distance is None or distance < best_distance:
-            best_account = account
-            best_distance = distance
+        distances.append((account, distance))
 
-    if best_account is None or best_distance is None:
-        raise RuntimeError("Failed to find a closest account.")
-
-    return best_account, best_distance
+    distances.sort(key=lambda pair: pair[1])
+    return distances[: max(0, min(k, len(distances)))]
 
 
-def main(dataset_path: Path | str = "data/tweets_400.csv") -> None:  # pragma: no cover - CLI utility
+def main(dataset_path: Path | str = "data/tweets_400.csv") -> None:  # pragma: no cover - CLI helper
+    """Small CLI demo that prints a sanity self-distance and the top-5 neighbors."""
+
     embeddings = load_account_embeddings(dataset_path)
-    target = "ArianaGrande"
-    account, distance = closest_account(target, embeddings)
-    print(f"Closest account to {target}: {account} (EMD = {distance:.4f})")
+
+    # Pick the first account as a quick demo target.
+    target = next(iter(embeddings))
+
+    self_distance = earth_movers_distance(embeddings[target], embeddings[target])
+    print(f"Self EMD for {target}: {self_distance:.6f} (should be ~0)")
+
+    print(f"Top similar accounts to {target}:")
+    for account, distance in top_k_similar_accounts(target, embeddings, k=5):
+        print(f"  - {account}: EMD = {distance:.4f}")
 
 
-if __name__ == "__main__":  # pragma: no cover - CLI utility
-    main()
+if __name__ == "__main__":  # pragma: no cover - CLI helper
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--dataset",
+        default="data/tweets_400.csv",
+        help="Path to the tweets CSV (default: data/tweets_400.csv)",
+    )
+    args = parser.parse_args()
+
+    main(args.dataset)
